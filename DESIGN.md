@@ -56,20 +56,20 @@ abstain は「禁止しない」ではなく「違反が無い」の意味に限
 
 `expect(<base>).<modifier?>.<matcher>(<args>)` を matcher 呼び出しの最外 `CallExpression` から内側へ `MemberExpression` 連鎖を辿り、1 レコードへ正規化する。
 
-| フィールド             | 内容                                                                                               |
-| ---------------------- | -------------------------------------------------------------------------------------------------- |
-| `matcherName`          | 終端 property 名。computed（`expect(x)["toBe"]`）は null。                                         |
-| `negation`             | 連鎖に `not` を含むか。                                                                            |
-| `modifier`             | 連鎖の `resolves` / `rejects` / null。                                                             |
-| `matcherArgs`          | matcher 引数の AST。比較は structuralKey による。                                                  |
-| `base`                 | `expect(...)` 第 1 引数。`baseShape` へ分解。                                                      |
-| `baseShape.kind`       | `member`（`r.a`）/ `call`（`add(1,2)`）/ `identifier`（`r`）/ `other`（論理式・三項・spread 等）。 |
-| `baseShape.root`       | member の最深 object 名 / call の callee 正規化名。                                                |
-| `baseShape.accessPath` | member のプロパティ列（`["a"]`、computed は記号で潰す）。                                          |
-| `baseShape.callArgs`   | call の引数 node 列。                                                                              |
-| `sourceOrder`          | テスト本体 statement 列内の出現インデックス。                                                      |
+| フィールド             | 内容                                                                                                                                                                             |
+| ---------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `matcherName`          | 終端 property 名。computed（`expect(x)["toBe"]`）は null。                                                                                                                       |
+| `negation`             | 連鎖に `not` を含むか。                                                                                                                                                          |
+| `modifier`             | 連鎖の `resolves` / `rejects` / null。                                                                                                                                           |
+| `matcherArgs`          | matcher 引数の AST。比較は structuralKey による。                                                                                                                                |
+| `base`                 | `expect(...)` 第 1 引数。`baseShape` へ分解。                                                                                                                                    |
+| `baseShape.kind`       | `member`（`r.a`）/ `call`（`add(1,2)`）/ `identifier`（`r`）/ `other`（論理式・三項・spread 等）。                                                                               |
+| `baseShape.root`       | member の最深 object 名 / call の callee 正規化名。                                                                                                                              |
+| `baseShape.accessPath` | member のプロパティ列（`["a"]`）。member 連鎖に computed（`r[i]`）が 1 つでもあれば、フィールド名が静的に確定しないため kind を `other` に倒す（consolidate の誤断定を避ける）。 |
+| `baseShape.callArgs`   | call の引数 node 列。                                                                                                                                                            |
+| `sourceOrder`          | テスト本体 statement 列内の出現インデックス。                                                                                                                                    |
 
-`structuralKey(node)` は AST を再帰で辿り、**リテラル値を捨象** し、**Identifier 名・プロパティ名は保持** した文字列を返す。これにより `add(1,2)` と `add(3,4)` は同形（同じ key）、`result.a` と `result.b` は異形（別 key）と峻別できる。これが「何が一定で何が変化しているか」を判定する核である。computed プロパティ・SpreadElement・TemplateLiteral は安全側（区別がつかない＝abstain/generic に倒す）へ寄せる。
+`structuralKey(node)` は AST を再帰で辿り、**リテラル値を捨象** し、**Identifier 名・プロパティ名は保持** した文字列を返す。これにより `add(1,2)` と `add(3,4)` は同形（同じ key）、`result.a` と `result.b` は異形（別 key）と峻別できる。これが「何が一定で何が変化しているか」を判定する核である。computed メンバ base・spread を含む call 引数は安全側（generic に倒す）へ寄せる。optional chain（`r?.a`）は `ChainExpression` を剥がして通常の member と同様に扱う。
 
 ## 7. 振り分けアルゴリズム routeTest
 
@@ -84,9 +84,10 @@ abstain は「禁止しない」ではなく「違反が無い」の意味に限
          root 全一致 ∧ accessPath 相違 → consolidate
          それ以外（別オブジェクト／完全重複）→ generic
      - kind === call:
-         callee 全一致 ∧ callArgs が同形（structuralKey 一致）∧ 値のみ相違 → each-or-split
          callee 不一致 → split-by-heterogeneity
-         それ以外（引数個数・構造の不一致、spread を含む）→ generic
+         引数に spread を含む、または引数の構造（structuralKey）が不一致 → generic
+         引数の構造一致 ∧ 引数の「値」が相違（call の入力が実際に変化）→ each-or-split
+         引数の値も同一（入力が同じで expected だけ違う／完全重複）→ generic
      - kind === identifier:
          → generic
 6. 上記で出口が確定しなかった残り → generic。
@@ -96,7 +97,7 @@ abstain は「禁止しない」ではなく「違反が無い」の意味に限
 
 ## 8. 各 Step の AST 述語
 
-- **Step 0（Act 挟み込み）**: テスト本体の statement 列を走査。`expect` を含む `ExpressionStatement` を E、それ以外で観測状態を変えうるものを A（Act）とする。A の判定は保守的に既知パターンのみ: `AssignmentExpression` / `UpdateExpression`（`x++` 等）/ 既知 mutating メソッド呼び出し（`.push` `.pop` `.shift` `.unshift` `.splice` `.sort` `.reverse` `.set` `.delete` `.add` `.clear` `.dispatch` 等）/ `await` を伴う呼び出し。**最初の expect より前の `VariableDeclaration` は setup とみなし Act 扱いしない**（誤検出回避）。最初の expect と最後の expect の開区間に A が 1 つでもあれば split-by-act。
+- **Step 0（Act 挟み込み）**: テスト本体の statement 列を走査。`expect` を含む `ExpressionStatement` を E、それ以外で観測状態を変えうるものを A（Act）とする。A の判定は保守的に次のみ: `AssignmentExpression` / `UpdateExpression`（`x++` 等）/ `await` を伴う式文 / **メソッド呼び出し**で「既知 mutating メソッド名（`.push` `.pop` `.shift` `.unshift` `.splice` `.sort` `.reverse` `.fill` `.copyWithin` `.set` `.delete` `.add` `.clear` `.dispatch`）」または「検証対象レシーバ（このテストの expect が見ている root 識別子）への呼び出し」のいずれか。**自由関数呼び出し（`console.log()` 等、レシーバ無し）は Act としない**（純粋呼び出しの誤検出回避）。この設計により、`counter.increment()`（`counter.value` を検証中＝レシーバが対象）は Act だが `console.log()` は Act でない、と峻別できる。`VariableDeclaration` は（最初の expect の前後を問わず）setup とみなし Act 扱いしない。最初の expect と最後の expect の開区間に A が 1 つでもあれば split-by-act。
 - **Step 1（同形性）**: 4 要素 signature `{ matcherName, negation, modifier, baseKind }` の不一致で split-by-heterogeneity。matcher 名だけの比較では `toBe` と `not.toBe`、同期と `resolves` の差を取りこぼすため 4 要素を正とする。matcherArgs の値違いはここでは見ない（Step 2 の領域）。
 - **Step 2（変化の所在）**: member は「root 同一 ∧ property 名が相違」、call は「callee の structuralKey 同一 ∧ arguments の structuralKey 同一 ∧ 値のみ相違」を判定。structuralKey がリテラル値を捨象するので、値だけ違う引数は同形、フィールド名が違う member は異形、と分けられる。
 

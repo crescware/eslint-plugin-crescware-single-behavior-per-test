@@ -20,6 +20,8 @@ type CallExpression = {
   arguments: Node[];
 };
 
+type ChainExpression = { type: "ChainExpression"; expression: Node };
+
 type AwaitExpression = { type: "AwaitExpression"; argument: Node };
 
 type AssignmentExpression = { type: "AssignmentExpression"; left: Node };
@@ -29,6 +31,10 @@ type UpdateExpression = {
   operator: string;
   argument: Node;
 };
+
+type ExpressionStatement = { type: "ExpressionStatement"; expression: Node };
+
+type BlockStatement = { type: "BlockStatement"; body: Node[] };
 
 type TemplateLiteral = { type: "TemplateLiteral"; expressions: Node[] };
 
@@ -50,10 +56,6 @@ type UnaryExpression = {
   operator: string;
   argument: Node;
 };
-
-type ExpressionStatement = { type: "ExpressionStatement"; expression: Node };
-
-type BlockStatement = { type: "BlockStatement"; body: Node[] };
 
 // A test callback: an arrow / function expression whose `body`, when it is a
 // block, holds the statements the test runs.
@@ -84,9 +86,26 @@ type Plugin = {
 // The callee identifiers whose callback bodies this rule treats as a test.
 const TEST_CALLEES = new Set<string>(["test", "it"]);
 
-// `await x` -> `x`; anything else is returned unchanged. Used so an async
-// assertion (`await expect(p).resolves.toBe(1)`) is seen as an expect, not an
-// Act.
+// Method names that conventionally mutate their receiver. A call to one of these
+// between assertions is treated as an Act regardless of the receiver.
+const MUTATING_METHODS = new Set<string>([
+  "push",
+  "pop",
+  "shift",
+  "unshift",
+  "splice",
+  "sort",
+  "reverse",
+  "fill",
+  "copyWithin",
+  "set",
+  "delete",
+  "add",
+  "clear",
+  "dispatch",
+]);
+
+// `await x` -> `x`; anything else is returned unchanged.
 const unwrapAwait = (node: Node): Node => {
   return node.type === "AwaitExpression"
     ? (node as AwaitExpression).argument
@@ -113,36 +132,6 @@ const isExpectCall = (node: Node): boolean => {
   return false;
 };
 
-// Whether an expression is a matcher chain anchored at an `expect(...)` call.
-// Walks down the receiver chain so modifier forms (`expect(x).not.toBe(...)`,
-// `expect(x).resolves.toBe(...)`) and async forms (`await expect(...)`) are
-// recognized. Each step descends to a strictly deeper child, so it terminates.
-const isExpectExpression = (node: Node): boolean => {
-  let current: Node = unwrapAwait(node);
-  while (
-    current.type === "MemberExpression" ||
-    current.type === "CallExpression"
-  ) {
-    if (isExpectCall(current)) {
-      return true;
-    }
-    current =
-      current.type === "MemberExpression"
-        ? (current as MemberExpression).object
-        : (current as CallExpression).callee;
-  }
-  return false;
-};
-
-// A statement that is a top-level assertion: `expect(...).matcher(...)` (or its
-// awaited form) written as an ExpressionStatement.
-const isExpectStatement = (statement: Node): boolean => {
-  return (
-    statement.type === "ExpressionStatement" &&
-    isExpectExpression((statement as ExpressionStatement).expression)
-  );
-};
-
 // The identifier at the root of a call's callee, seen through member and call
 // layers: `test(...)` -> "test", `it.only(...)` -> "it", and
 // `test.each(table)(...)` -> "test". Returns null when the callee bottoms out in
@@ -165,9 +154,9 @@ const rootCalleeName = (call: CallExpression): string | null => {
   }
 };
 
-// The function passed as the test body: the first argument that is an arrow or
-// function expression. `test.each(table)(name, cb)` keeps the callback as an
-// argument of the outer call, so this finds it there too.
+// The first argument that is an arrow / function expression: the test body.
+// `test.each(table)(name, cb)` keeps the callback on the outer call, so this
+// finds it there too.
 const testCallback = (call: CallExpression): FunctionNode | null => {
   for (const arg of call.arguments) {
     if (
@@ -180,17 +169,39 @@ const testCallback = (call: CallExpression): FunctionNode | null => {
   return null;
 };
 
-// A readable name for a callee / assignment target: `foo` -> "foo",
-// `obj.method` -> "obj.method". Computed and exotic forms collapse to "…".
+// The deepest object identifier of a member chain: `a.b.c` -> "a", `a` -> "a".
+// Returns null when the chain bottoms out in something else (a call, `this`).
+const memberRoot = (node: Node): string | null => {
+  let current: Node = node;
+  while (current.type === "MemberExpression") {
+    current = (current as MemberExpression).object;
+  }
+  return current.type === "Identifier" ? (current as Identifier).name : null;
+};
+
+const readableProperty = (node: Node): string => {
+  if (node.type === "Identifier") {
+    return (node as Identifier).name;
+  }
+  if (node.type === "Literal") {
+    const literal = node as Literal;
+    return literal.raw ?? String(literal.value);
+  }
+  return "#prop";
+};
+
+// A readable name for a callee / target: `foo` -> "foo", `obj.method` ->
+// "obj.method", `arr[0]` -> "arr[0]". Exotic forms collapse to "…".
 const readable = (node: Node): string => {
   if (node.type === "Identifier") {
     return (node as Identifier).name;
   }
   if (node.type === "MemberExpression") {
     const member = node as MemberExpression;
-    if (!member.computed && member.property.type === "Identifier") {
-      return `${readable(member.object)}.${(member.property as Identifier).name}`;
+    if (member.computed) {
+      return `${readable(member.object)}[${readableProperty(member.property)}]`;
     }
+    return `${readable(member.object)}.${readableProperty(member.property)}`;
   }
   return "…";
 };
@@ -263,17 +274,6 @@ const nodeKey = (node: Node, keepValues: boolean): string => {
   }
 };
 
-const readableProperty = (node: Node): string => {
-  if (node.type === "Identifier") {
-    return (node as Identifier).name;
-  }
-  if (node.type === "Literal") {
-    const literal = node as Literal;
-    return literal.raw ?? String(literal.value);
-  }
-  return "#prop";
-};
-
 const tupleKey = (nodes: Node[], keepValues: boolean): string => {
   return nodes.map((node) => nodeKey(node, keepValues)).join(",");
 };
@@ -296,27 +296,34 @@ const baseShapeOf = (base: Node | undefined): BaseShape => {
   if (base === undefined) {
     return { kind: "other" };
   }
-  if (base.type === "Identifier") {
-    return { kind: "identifier", root: (base as Identifier).name };
+  // `r?.a` parses as a ChainExpression wrapping the (optional) member access.
+  const node =
+    base.type === "ChainExpression"
+      ? (base as ChainExpression).expression
+      : base;
+  if (node.type === "Identifier") {
+    return { kind: "identifier", root: (node as Identifier).name };
   }
-  if (base.type === "CallExpression") {
-    const call = base as CallExpression;
+  if (node.type === "CallExpression") {
+    const call = node as CallExpression;
     return { kind: "call", calleeNode: call.callee, argsNode: call.arguments };
   }
-  if (base.type === "MemberExpression") {
+  if (node.type === "MemberExpression") {
     const accessPath: string[] = [];
-    let current: Node = base;
+    let computed = false;
+    let current: Node = node;
     while (current.type === "MemberExpression") {
       const member = current as MemberExpression;
       if (member.computed) {
-        accessPath.unshift("#computed");
+        // A dynamic field (`r[i]`) has no statically known name, so we cannot
+        // safely assert a consolidate; treat the whole base as unclassifiable.
+        computed = true;
       } else {
         accessPath.unshift(readableProperty(member.property));
       }
       current = member.object;
     }
-    if (current.type !== "Identifier") {
-      // Rooted at a call / `this` / etc.: not safely consolidatable.
+    if (current.type !== "Identifier" || computed) {
       return { kind: "other" };
     }
     return { kind: "member", root: (current as Identifier).name, accessPath };
@@ -334,7 +341,8 @@ type ExpectOccurrence = {
 
 // Parse `expect(base).<not?>.<resolves|rejects?>.matcher(args)` into a record.
 // Returns null when the expression is not a matcher call anchored at expect
-// (e.g. a bare `expect(x)` with no matcher).
+// (e.g. a bare `expect(x)` with no matcher), so such a statement neither counts
+// as a direct assertion nor pollutes routing.
 const parseExpectChain = (expression: Node): ExpectOccurrence | null => {
   const root = unwrapAwait(expression);
   if (root.type !== "CallExpression") {
@@ -387,20 +395,42 @@ const parseExpectChain = (expression: Node): ExpectOccurrence | null => {
 // ---------------------------------------------------------------------------
 
 // A statement that changes observable state, used to detect "assert, act,
-// assert" inside one test. Conservative: declarations are setup, expect
-// statements are assertions, and only assignments / updates / awaits / bare
-// calls (a call whose result is discarded, presumed side-effecting) count.
-const isActStatement = (statement: Node): boolean => {
+// assert" inside one test. Conservative on calls: a bare function call is NOT an
+// Act (it may be pure logging), but a method call IS an Act when it either names
+// a known mutating method or is invoked on the value under test (e.g.
+// `counter.increment()` while the test asserts `counter.value`).
+const isActStatement = (
+  statement: Node,
+  underTestRoots: Set<string>,
+): boolean => {
   if (statement.type !== "ExpressionStatement") {
     return false;
   }
   const expression = (statement as ExpressionStatement).expression;
-  return (
+  if (
     expression.type === "AwaitExpression" ||
     expression.type === "AssignmentExpression" ||
-    expression.type === "UpdateExpression" ||
-    expression.type === "CallExpression"
-  );
+    expression.type === "UpdateExpression"
+  ) {
+    return true;
+  }
+  if (expression.type !== "CallExpression") {
+    return false;
+  }
+  const callee = (expression as CallExpression).callee;
+  if (callee.type !== "MemberExpression") {
+    return false;
+  }
+  const member = callee as MemberExpression;
+  if (
+    !member.computed &&
+    member.property.type === "Identifier" &&
+    MUTATING_METHODS.has((member.property as Identifier).name)
+  ) {
+    return true;
+  }
+  const root = memberRoot(member.object);
+  return root !== null && underTestRoots.has(root);
 };
 
 const actDescription = (statement: Node): string => {
@@ -426,31 +456,33 @@ const actDescription = (statement: Node): string => {
 };
 
 // ---------------------------------------------------------------------------
-// Messages: each carries the fix as a prompt for the reader (a coding agent).
+// Messages: each carries the fix as a prompt for the reader (a coding agent),
+// an evaluable criterion, and a guard against the cheap dodge of deleting an
+// assertion to silence the rule.
 // ---------------------------------------------------------------------------
 
 const consolidateMessage = (root: string, fields: string[]): string => {
-  return `This test asserts ${fields.length} fields of the same object '${root}' (${fields.join(", ")}) with separate expect() calls. Consolidate them into ONE exhaustive 'expect(${root}).toEqual({ ... })' listing every field. Do not use a partial-match matcher (toMatchObject etc.): a field you omit would go unchecked. This is not a split and not test.each — it is one object compared once.`;
+  return `This test asserts ${fields.length} fields of the same object '${root}' (${fields.join(", ")}) with separate expect() calls. Replace them with ONE exhaustive 'expect(${root}).toEqual({ ... })' that lists every field, and delete the individual expect() statements. A dotted field denotes nesting ('meta.id' becomes { meta: { id: ... } }). Do not use a partial-match matcher (toMatchObject etc.): a field you omit would go unchecked. This is not a split and not test.each — it is one object compared once.`;
 };
 
 const splitByActMessage = (description: string): string => {
-  return `This test asserts state both before and after a change (${description}) in the same test. The before- and after-states are two different behaviors. Split into separate test() calls at that boundary, giving the second its own Arrange/Act (never leave an empty test). The problem is not the number of expects; it is the Act sitting between them. This is not a toEqual consolidation.`;
+  return `This test asserts state both before and after a change (${description}) in the same test, so it verifies two behaviors. Criterion: name what each side guarantees — the first the state before ${description}, the second its effect; if both guarantees matter, they are two tests. Split into separate test() calls at that boundary, giving the second its own Arrange/Act; never leave an empty test, and do not just delete the before-state assertion to silence this. The problem is not the number of expects but the Act between them. This is not a toEqual consolidation.`;
 };
 
 const splitByHeterogeneityMessage = (summary: string): string => {
-  return `This test mixes assertions of different shapes (${summary}), so it verifies more than one contract. Split it into one test() per contract. This is not a toEqual consolidation and not test.each.`;
+  return `This test mixes assertions of different shapes (${summary}), so it verifies more than one contract. Criterion: each distinct shape is its own contract; give each its own test() with its own setup. Do not delete the odd assertion to make the shapes match — that silences the check instead of restoring single behavior. This is not a toEqual consolidation and not test.each.`;
 };
 
 const eachOrSplitMessage = (operation: string, caseCount: number): string => {
-  return `This test calls the same operation '${operation}' ${caseCount} times with only the inputs changing. Syntax cannot decide the fix, so this is a question, not a verdict. Option 1: if these are the same logic with different data, rewrite as test.each. Option 2: if they assert different contracts (e.g. normal vs boundary/error), split into separate test() calls. Criterion: restate each case as one sentence — same sentence with different values means test.each, a different claim means split. You, who know the intent, decide.`;
+  return `This test calls the same operation '${operation}' ${caseCount} times with only the inputs changing. Syntax cannot decide the fix, so this is a question, not a verdict. Option 1: if these are the same logic with different data, rewrite as test.each. Option 2: if they assert different contracts (e.g. normal vs boundary/error), split into separate test() calls. Criterion: restate each case as one sentence — same sentence with different values means test.each, a different claim means split. Either way keep every case; do not clear this by deleting cases down to one. You, who know the intent, decide.`;
 };
 
 const genericMessage = (count: number): string => {
-  return `This test makes ${count} top-level expect() assertions, but a test must verify a single behavior. The exit could not be named automatically, so keep the ban and pick the fix with this checklist: (1) Is there a state change (assignment, mutation, await, call) between assertions? Split into separate tests at that boundary. (2) Do the matchers or asserted shapes differ? Split into one test per contract. (3) Are these different fields of the same object? Consolidate into one exhaustive toEqual (no partial match). (4) Is it the same operation with only inputs changing? Use test.each if it is the same claim with different data, otherwise split. Do not silence this by deleting an assertion.`;
+  return `This test makes ${count} top-level expect() assertions, but a test must verify a single behavior. The exit could not be named automatically, so keep the ban and pick the fix with this checklist: (1) Is there a state change (assignment, mutation, await, or a call on the value under test) between assertions? Split into separate tests at that boundary. (2) Do the matchers or asserted shapes differ? Split into one test per contract. (3) Are these different fields of the same object? Replace them with one exhaustive toEqual (no partial match). (4) Is it the same operation with only the inputs changing? Syntax cannot decide this one — restate each case as a sentence: the same sentence with different values suggests test.each, a different claim suggests split; ask, do not guess. Do not silence this by deleting an assertion.`;
 };
 
 // A human description of each occurrence's shape, used to explain a
-// heterogeneity split: "toEqual on parse()" vs "toThrow on errs".
+// heterogeneity split: "toEqual on parse() vs toThrow on errs".
 const shapeSummary = (occurrences: ExpectOccurrence[]): string => {
   const describe = (occurrence: ExpectOccurrence): string => {
     const matcher = `${occurrence.negation ? "not." : ""}${
@@ -488,48 +520,63 @@ const shapeSummary = (occurrences: ExpectOccurrence[]): string => {
 
 const routeTest = (body: BlockStatement): string | null => {
   const statements = body.body;
-  const expectIndices: number[] = [];
+  const entries: { index: number; occurrence: ExpectOccurrence }[] = [];
   statements.forEach((statement, index) => {
-    if (isExpectStatement(statement)) {
-      expectIndices.push(index);
+    if (statement.type !== "ExpressionStatement") {
+      return;
+    }
+    const occurrence = parseExpectChain(
+      (statement as ExpressionStatement).expression,
+    );
+    if (occurrence !== null) {
+      entries.push({ index, occurrence });
     }
   });
-  const count = expectIndices.length;
+  const count = entries.length;
   if (count <= 1) {
     return null;
+  }
+  const occurrences = entries.map((entry) => entry.occurrence);
+
+  // The objects under direct test, used to recognize a mutation of the subject
+  // (e.g. `counter.increment()`) as an Act.
+  const underTestRoots = new Set<string>();
+  for (const occurrence of occurrences) {
+    const shape = occurrence.baseShape;
+    if (shape.kind === "member" || shape.kind === "identifier") {
+      underTestRoots.add(shape.root);
+    }
   }
 
   // Step 0: an Act between the first and last assertion means the test observes
   // two states; split at the boundary.
-  const first = expectIndices[0] ?? 0;
-  const last = expectIndices[count - 1] ?? 0;
+  const expectIndices = new Set(entries.map((entry) => entry.index));
+  const first = entries[0]?.index ?? 0;
+  const last = entries[count - 1]?.index ?? 0;
   for (let index = first + 1; index < last; index++) {
-    const statement = statements[index];
-    if (statement === undefined || isExpectStatement(statement)) {
+    if (expectIndices.has(index)) {
       continue;
     }
-    if (isActStatement(statement)) {
+    const statement = statements[index];
+    if (statement === undefined) {
+      continue;
+    }
+    if (isActStatement(statement, underTestRoots)) {
       return splitByActMessage(actDescription(statement));
     }
   }
 
-  const parsed = expectIndices.map((index) =>
-    parseExpectChain((statements[index] as ExpressionStatement).expression),
-  );
-
   // Guard: anything we cannot classify safely keeps the ban but falls back to
   // the generic self-diagnosis message.
   if (
-    parsed.some(
+    occurrences.some(
       (occurrence) =>
-        occurrence === null ||
         occurrence.matcherName === null ||
         occurrence.baseShape.kind === "other",
     )
   ) {
     return genericMessage(count);
   }
-  const occurrences = parsed as ExpectOccurrence[];
 
   // Step 1: homogeneity of the assertion shape.
   const signature = (occurrence: ExpectOccurrence): string => {
@@ -550,13 +597,13 @@ const routeTest = (body: BlockStatement): string | null => {
           accessPath: string[];
         },
     );
-    const roots = new Set(shapes.map((shape) => shape.root));
-    if (roots.size > 1) {
+    if (new Set(shapes.map((shape) => shape.root)).size > 1) {
       return genericMessage(count);
     }
     const paths = shapes.map((shape) => shape.accessPath.join("."));
-    if (new Set(paths).size >= 2) {
-      return consolidateMessage(shapes[0]?.root ?? "", paths);
+    const distinct = [...new Set(paths)];
+    if (distinct.length >= 2) {
+      return consolidateMessage(shapes[0]?.root ?? "", distinct);
     }
     return genericMessage(count);
   }
@@ -582,10 +629,11 @@ const routeTest = (body: BlockStatement): string | null => {
     ) {
       return genericMessage(count);
     }
+    // Same callee, same argument shape: an each candidate only if the input
+    // values actually differ. Identical inputs (only the expected value varies,
+    // or an exact duplicate) are not parameterizable.
     if (
-      new Set(
-        occurrences.map((occurrence) => nodeKey(occurrence.matcherCall, true)),
-      ).size <= 1
+      new Set(shapes.map((shape) => tupleKey(shape.argsNode, true))).size <= 1
     ) {
       return genericMessage(count);
     }
