@@ -105,6 +105,30 @@ const MUTATING_METHODS = new Set<string>([
   "dispatch",
 ]);
 
+// Loop statements whose body, if it asserts, is a hand-rolled parametrized test.
+const LOOP_TYPES = new Set<string>([
+  "ForStatement",
+  "ForOfStatement",
+  "ForInStatement",
+  "WhileStatement",
+  "DoWhileStatement",
+]);
+
+// Array iteration methods whose callback, if it asserts, is the same anti-pattern
+// as a loop (iterating assertions over data instead of using test.each).
+const ITER_METHODS = new Set<string>([
+  "forEach",
+  "map",
+  "flatMap",
+  "filter",
+  "reduce",
+  "reduceRight",
+  "some",
+  "every",
+  "find",
+  "findIndex",
+]);
+
 // `await x` -> `x`; anything else is returned unchanged.
 const unwrapAwait = (node: Node): Node => {
   return node.type === "AwaitExpression"
@@ -280,6 +304,80 @@ const tupleKey = (nodes: Node[], keepValues: boolean): string => {
 
 const hasSpread = (nodes: Node[]): boolean => {
   return nodes.some((node) => node.type === "SpreadElement");
+};
+
+// `items.forEach(...)`, `items.map(...)`, etc.: a call whose callee is one of the
+// iteration methods.
+const isIterationCall = (node: Node): boolean => {
+  if (node.type !== "CallExpression") {
+    return false;
+  }
+  const callee = (node as CallExpression).callee;
+  if (callee.type !== "MemberExpression") {
+    return false;
+  }
+  const member = callee as MemberExpression;
+  return (
+    !member.computed &&
+    member.property.type === "Identifier" &&
+    ITER_METHODS.has((member.property as Identifier).name)
+  );
+};
+
+// Whether an arbitrary AST subtree contains an `expect(...)` anchor. Walks the
+// real node objects generically (skipping the `parent` back-reference to avoid
+// cycles) so it works on nodes whose shape this file does not model.
+const containsExpectCall = (value: unknown): boolean => {
+  if (value === null || typeof value !== "object") {
+    return false;
+  }
+  if (Array.isArray(value)) {
+    return value.some((item) => containsExpectCall(item));
+  }
+  const record = value as Record<string, unknown>;
+  if (typeof record["type"] === "string" && isExpectCall(value as Node)) {
+    return true;
+  }
+  for (const key of Object.keys(record)) {
+    if (key === "parent") {
+      continue;
+    }
+    if (containsExpectCall(record[key])) {
+      return true;
+    }
+  }
+  return false;
+};
+
+// Whether the test body iterates assertions: a loop, or an iteration-method
+// callback, whose subtree contains an `expect(...)`. That is a hand-rolled
+// parametrized test and should become test.each.
+const hasLoopAssertion = (value: unknown): boolean => {
+  if (value === null || typeof value !== "object") {
+    return false;
+  }
+  if (Array.isArray(value)) {
+    return value.some((item) => hasLoopAssertion(item));
+  }
+  const record = value as Record<string, unknown>;
+  const type = record["type"];
+  if (typeof type === "string") {
+    if (LOOP_TYPES.has(type) && containsExpectCall(value)) {
+      return true;
+    }
+    if (isIterationCall(value as Node) && containsExpectCall(value)) {
+      return true;
+    }
+  }
+  for (const key of Object.keys(record)) {
+    if (key === "parent") {
+      continue;
+    }
+    if (hasLoopAssertion(record[key])) {
+      return true;
+    }
+  }
+  return false;
 };
 
 // ---------------------------------------------------------------------------
@@ -481,6 +579,10 @@ const genericMessage = (count: number): string => {
   return `This test makes ${count} top-level expect() assertions, but a test must verify a single behavior. The exit could not be named automatically, so keep the ban and pick the fix with this checklist: (1) Is there a state change (assignment, mutation, await, or a call on the value under test) between assertions? Split into separate tests at that boundary. (2) Do the matchers or asserted shapes differ? Split into one test per contract. (3) Are these different fields of the same object? Replace them with one exhaustive toEqual (no partial match). (4) Is it the same operation with only the inputs changing? Syntax cannot decide this one — restate each case as a sentence: the same sentence with different values suggests test.each, a different claim suggests split; ask, do not guess. Do not silence this by deleting an assertion.`;
 };
 
+const loopEachMessage = (): string => {
+  return `This test asserts inside a loop (or an iteration callback), which is a hand-rolled parametrized test: the same assertion logic applied to many inputs. Rewrite it as test.each(cases)(name, (case) => { ... }) so every case becomes a named, independently-reported test — a loop stops at the first failure and hides which input failed. This is parametrization, not a consolidation or a split.`;
+};
+
 // A human description of each occurrence's shape, used to explain a
 // heterogeneity split: "toEqual on parse() vs toThrow on errs".
 const shapeSummary = (occurrences: ExpectOccurrence[]): string => {
@@ -519,6 +621,11 @@ const shapeSummary = (occurrences: ExpectOccurrence[]): string => {
 // ---------------------------------------------------------------------------
 
 const routeTest = (body: BlockStatement): string | null => {
+  // A loop or iteration callback that asserts is a hand-rolled parametrized
+  // test; route it to test.each before counting direct expects.
+  if (hasLoopAssertion(body)) {
+    return loopEachMessage();
+  }
   const statements = body.body;
   const entries: { index: number; occurrence: ExpectOccurrence }[] = [];
   statements.forEach((statement, index) => {

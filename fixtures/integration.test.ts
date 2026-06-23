@@ -62,6 +62,10 @@ const genericMessage = (count: number): string => {
   return `This test makes ${count} top-level expect() assertions, but a test must verify a single behavior. The exit could not be named automatically, so keep the ban and pick the fix with this checklist: (1) Is there a state change (assignment, mutation, await, or a call on the value under test) between assertions? Split into separate tests at that boundary. (2) Do the matchers or asserted shapes differ? Split into one test per contract. (3) Are these different fields of the same object? Replace them with one exhaustive toEqual (no partial match). (4) Is it the same operation with only the inputs changing? Syntax cannot decide this one — restate each case as a sentence: the same sentence with different values suggests test.each, a different claim suggests split; ask, do not guess. Do not silence this by deleting an assertion.`;
 };
 
+const loopEachMessage = (): string => {
+  return `This test asserts inside a loop (or an iteration callback), which is a hand-rolled parametrized test: the same assertion logic applied to many inputs. Rewrite it as test.each(cases)(name, (case) => { ... }) so every case becomes a named, independently-reported test — a loop stops at the first failure and hides which input failed. This is parametrization, not a consolidation or a split.`;
+};
+
 // Each NG case file maps to the ordered list of diagnostic messages it produces
 // (one per violating test in the file).
 const ngCases: [string, string[]][] = [
@@ -129,6 +133,10 @@ const ngCases: [string, string[]][] = [
   ["ng-each-three.ts", [eachOrSplitMessage("double", 3)]],
   ["ng-each-await-resolves.ts", [eachOrSplitMessage("load", 2)]],
   ["ng-each-object-arg.ts", [eachOrSplitMessage("build", 2)]],
+  // loop-each (assertions inside a loop / iteration callback)
+  ["ng-loop-for-of.ts", [loopEachMessage()]],
+  ["ng-loop-classic.ts", [loopEachMessage()]],
+  ["ng-loop-foreach.ts", [loopEachMessage()]],
   // generic
   ["ng-generic-computed-matcher.ts", [genericMessage(2)]],
   ["ng-generic-other-base.ts", [genericMessage(2)]],
@@ -151,7 +159,7 @@ const okFiles = [
   "ok-single.ts",
   "ok-none.ts",
   "ok-concise-arrow.ts",
-  "ok-nested-loop.ts",
+  "ok-loop-setup.ts",
   "ok-nested-helper.ts",
   "ok-separate-tests.ts",
   "ok-each-single.ts",
