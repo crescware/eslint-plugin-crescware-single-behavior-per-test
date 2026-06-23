@@ -36,6 +36,19 @@ type ExpressionStatement = { type: "ExpressionStatement"; expression: Node };
 
 type BlockStatement = { type: "BlockStatement"; body: Node[] };
 
+type VariableDeclaration = {
+  type: "VariableDeclaration";
+  declarations: Node[];
+};
+
+type VariableDeclarator = {
+  type: "VariableDeclarator";
+  id: Node;
+  init: Node | null;
+};
+
+type FunctionDeclaration = { type: "FunctionDeclaration"; id: Node | null };
+
 type TemplateLiteral = { type: "TemplateLiteral"; expressions: Node[] };
 
 type ArrayExpression = { type: "ArrayExpression"; elements: (Node | null)[] };
@@ -380,6 +393,82 @@ const hasLoopAssertion = (value: unknown): boolean => {
   return false;
 };
 
+// The names of locally-declared functions whose body asserts (`const check =
+// (v) => expect(v)...`, `function check() { expect... }`). Calling such a helper
+// repeatedly is the same hand-rolled parametrization as a loop.
+const assertingHelperNames = (statements: Node[]): Set<string> => {
+  const names = new Set<string>();
+  for (const statement of statements) {
+    if (statement.type === "FunctionDeclaration") {
+      const fn = statement as FunctionDeclaration;
+      if (
+        fn.id !== null &&
+        fn.id.type === "Identifier" &&
+        containsExpectCall(statement)
+      ) {
+        names.add((fn.id as Identifier).name);
+      }
+      continue;
+    }
+    if (statement.type === "VariableDeclaration") {
+      for (const declarator of (statement as VariableDeclaration)
+        .declarations) {
+        if (declarator.type !== "VariableDeclarator") {
+          continue;
+        }
+        const declared = declarator as VariableDeclarator;
+        const init = declared.init;
+        if (
+          init !== null &&
+          (init.type === "ArrowFunctionExpression" ||
+            init.type === "FunctionExpression") &&
+          declared.id.type === "Identifier" &&
+          containsExpectCall(init)
+        ) {
+          names.add((declared.id as Identifier).name);
+        }
+      }
+    }
+  }
+  return names;
+};
+
+// Whether an asserting local helper is invoked two or more times as direct
+// statements: the helper form of a parametrized test.
+const hasRepeatedHelperAssertion = (body: BlockStatement): boolean => {
+  const helpers = assertingHelperNames(body.body);
+  if (helpers.size === 0) {
+    return false;
+  }
+  const counts = new Map<string, number>();
+  for (const statement of body.body) {
+    if (statement.type !== "ExpressionStatement") {
+      continue;
+    }
+    const expression = unwrapAwait(
+      (statement as ExpressionStatement).expression,
+    );
+    if (expression.type !== "CallExpression") {
+      continue;
+    }
+    const callee = (expression as CallExpression).callee;
+    if (callee.type !== "Identifier") {
+      continue;
+    }
+    const name = (callee as Identifier).name;
+    if (!helpers.has(name)) {
+      continue;
+    }
+    counts.set(name, (counts.get(name) ?? 0) + 1);
+  }
+  for (const count of counts.values()) {
+    if (count >= 2) {
+      return true;
+    }
+  }
+  return false;
+};
+
 // ---------------------------------------------------------------------------
 // ExpectOccurrence: a normalized view of one `expect(base).<mods>.matcher(args)`
 // ---------------------------------------------------------------------------
@@ -580,7 +669,7 @@ const genericMessage = (count: number): string => {
 };
 
 const loopEachMessage = (): string => {
-  return `This test asserts inside a loop (or an iteration callback), which is a hand-rolled parametrized test: the same assertion logic applied to many inputs. Rewrite it as test.each(cases)(name, (case) => { ... }) so every case becomes a named, independently-reported test — a loop stops at the first failure and hides which input failed. This is parametrization, not a consolidation or a split.`;
+  return `This test runs the same assertion logic over several inputs by hand — via a loop, an iteration callback, or a repeated call to a local assertion helper. That is a hand-rolled parametrized test. Rewrite it as test.each(cases)(name, (case) => { ... }) so every case becomes a named, independently-reported test — a loop or repeated call stops at the first failure and hides which input failed. This is parametrization, not a consolidation or a split.`;
 };
 
 // A human description of each occurrence's shape, used to explain a
@@ -621,9 +710,10 @@ const shapeSummary = (occurrences: ExpectOccurrence[]): string => {
 // ---------------------------------------------------------------------------
 
 const routeTest = (body: BlockStatement): string | null => {
-  // A loop or iteration callback that asserts is a hand-rolled parametrized
-  // test; route it to test.each before counting direct expects.
-  if (hasLoopAssertion(body)) {
+  // A loop / iteration callback that asserts, or an asserting local helper
+  // called repeatedly, is a hand-rolled parametrized test; route it to test.each
+  // before counting direct expects.
+  if (hasLoopAssertion(body) || hasRepeatedHelperAssertion(body)) {
     return loopEachMessage();
   }
   const statements = body.body;

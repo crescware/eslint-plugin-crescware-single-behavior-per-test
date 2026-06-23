@@ -63,7 +63,7 @@ const genericMessage = (count: number): string => {
 };
 
 const loopEachMessage = (): string => {
-  return `This test asserts inside a loop (or an iteration callback), which is a hand-rolled parametrized test: the same assertion logic applied to many inputs. Rewrite it as test.each(cases)(name, (case) => { ... }) so every case becomes a named, independently-reported test — a loop stops at the first failure and hides which input failed. This is parametrization, not a consolidation or a split.`;
+  return `This test runs the same assertion logic over several inputs by hand — via a loop, an iteration callback, or a repeated call to a local assertion helper. That is a hand-rolled parametrized test. Rewrite it as test.each(cases)(name, (case) => { ... }) so every case becomes a named, independently-reported test — a loop or repeated call stops at the first failure and hides which input failed. This is parametrization, not a consolidation or a split.`;
 };
 
 // Each NG case file maps to the ordered list of diagnostic messages it produces
@@ -137,6 +137,7 @@ const ngCases: [string, string[]][] = [
   ["ng-loop-for-of.ts", [loopEachMessage()]],
   ["ng-loop-classic.ts", [loopEachMessage()]],
   ["ng-loop-foreach.ts", [loopEachMessage()]],
+  ["ng-helper-repeated.ts", [loopEachMessage()]],
   // generic
   ["ng-generic-computed-matcher.ts", [genericMessage(2)]],
   ["ng-generic-other-base.ts", [genericMessage(2)]],
@@ -164,6 +165,7 @@ const okFiles = [
   "ok-separate-tests.ts",
   "ok-each-single.ts",
   "ok-describe-single.ts",
+  "ok-helper-single.ts",
 ];
 
 let defaultDiagnostics: Diagnostic[] = [];
